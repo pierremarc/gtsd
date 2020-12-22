@@ -1,6 +1,7 @@
 use std::{
     cell::{RefCell, RefMut},
     cmp::min,
+    error::Error,
     fmt::{Display, Formatter},
     rc::Rc,
 };
@@ -110,7 +111,7 @@ where
         return b
             .into_iter()
             .enumerate()
-            .map(|(i, x)| Op::Ins(i, x))
+            .map(|(i, x)| Op::Ins(i, x.clone()))
             .collect();
     }
 
@@ -137,14 +138,14 @@ where
             let sub = d[[i - 1, j - 1]] + sub_cost;
             let val = min(del, min(ins, sub));
             let op = if val == del {
-                Op::Del(j, ea.clone())
+                Op::Del(i - 1, ea.clone())
             } else if val == ins {
-                Op::Ins(j, eb.clone())
+                Op::Ins(i - 1, eb.clone())
             } else if val == sub {
                 if sub_cost == 0 {
-                    Op::Id(j, eb.clone())
+                    Op::Id(i - 1, eb.clone())
                 } else {
-                    Op::Sub(j, ea.clone(), eb.clone())
+                    Op::Sub(i - 1, ea.clone(), eb.clone())
                 }
             } else {
                 Op::Unreachable
@@ -186,6 +187,49 @@ where
     }
     result.reverse();
     result
+}
+
+#[derive(Debug)]
+enum PatchError {
+    SourceNotFound(usize),
+    Unreachable,
+}
+
+impl Display for PatchError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PatchError::SourceNotFound(idx) => write!(
+                f,
+                "PatchError: index {} could not be found in source sequence",
+                idx
+            ),
+            PatchError::Unreachable => write!(f, "PatchError: got an unreachable op"),
+        }
+    }
+}
+
+impl Error for PatchError {}
+
+fn patch<'a, Iter, T>(diff: Diff<T>, it: &'a Iter) -> Result<Vec<T>, PatchError>
+where
+    &'a Iter: IntoIterator<Item = T>,
+    T: Clone + PartialEq,
+{
+    let source: Vec<T> = it.into_iter().collect();
+    let mut result: Vec<T> = Vec::new();
+    for op in diff {
+        match op {
+            Op::Id(i, _) => source
+                .get(i)
+                .map(|t| result.push(t.clone()))
+                .ok_or(PatchError::SourceNotFound(i))?,
+            Op::Ins(_, t) => result.push(t.clone()),
+            Op::Sub(_, _, t) => result.push(t.clone()),
+            Op::Del(_, _) => {}
+            Op::Unreachable => return Err(PatchError::Unreachable),
+        }
+    }
+    Ok(result)
 }
 
 type Shared<T> = Rc<RefCell<T>>;
@@ -353,6 +397,28 @@ fn append_to_root(
 //     result
 // }
 
+trait Tuple<F, S> {
+    fn fst(&self) -> &F;
+    fn snd(&self) -> &S;
+}
+
+impl<F, S> Tuple<F, S> for (F, S) {
+    fn fst(&self) -> &F {
+        &self.0
+    }
+    fn snd(&self) -> &S {
+        &self.1
+    }
+}
+impl<T> Tuple<T, T> for [T; 2] {
+    fn fst(&self) -> &T {
+        &self[0]
+    }
+    fn snd(&self) -> &T {
+        &self[1]
+    }
+}
+
 impl FlatNodeList {
     fn as_tree(self) -> Option<Node> {
         let roots: RefCell<Vec<(usize, Shared<Node>)>> = RefCell::new(Vec::new());
@@ -418,9 +484,100 @@ impl Display for FlatNodeList {
     }
 }
 
+trait Changeset {
+    type Store: Clone;
+
+    fn id(&self) -> &str;
+
+    fn apply(&self, store: &Self::Store) -> Self::Store;
+}
+
+struct Database<T, C>
+where
+    T: Clone,
+    C: Changeset<Store = T>,
+{
+    store: T,
+    version: usize,
+    changeset: Vec<C>,
+}
+
+impl<T, C> Database<T, C>
+where
+    T: Clone,
+    C: Changeset<Store = T>,
+{
+    fn new(store: T) -> Database<T, C> {
+        Database {
+            store,
+            version: 0,
+            changeset: Vec::new(),
+        }
+    }
+
+    fn mutate<M>(&mut self, mutator: M)
+    where
+        M: FnOnce(&T) -> C,
+    {
+        self.changeset.push(mutator(&self.store));
+        self.version += 1;
+    }
+
+    fn run_mutation(&mut self) {
+        self.store = self
+            .changeset
+            .iter()
+            .fold(self.store.clone(), |acc, c| c.apply(&acc));
+        self.changeset = Vec::new();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{attr, element, levenshtein_ops, text, FlatNodeList, Op};
+    use std::cell::RefCell;
+
+    use crate::{
+        attr, element, levenshtein_ops, patch, shared, text, Changeset, Database, FlatNodeList,
+        FlattenNode, Node, Op,
+    };
+    #[derive(Debug, Clone)]
+    struct Store {
+        name: String,
+        number: i64,
+    }
+
+    struct ChangeName {
+        name: String,
+    }
+
+    impl Changeset for ChangeName {
+        type Store = Store;
+        fn id(&self) -> &str {
+            "change-name"
+        }
+
+        fn apply(&self, store: &Self::Store) -> Self::Store {
+            let mut s = store.clone();
+            s.name = self.name.clone();
+            s
+        }
+    }
+    #[test]
+    fn simple_db() {
+        let mut db = Database::new(Store {
+            name: "Bob".to_string(),
+            number: 1,
+        });
+
+        db.mutate(|_s| ChangeName {
+            name: "Alice".to_string(),
+        });
+
+        db.run_mutation();
+
+        assert_eq!(db.version, 1);
+        assert_eq!(db.store.name, "Alice".to_string());
+    }
 
     // macro_rules! s {
     //     ($s:tt) => {
@@ -486,22 +643,49 @@ mod tests {
     fn tree_node() {
         let attr_1 = attr("foo", "bar");
         let text_1 = text("Hello World");
-        let root_a = element("tag1").append(attr_1).append(text_1).clone();
+        let root_a = element("tag1").append(attr_1).append(text_1);
 
         let attr_2 = attr("foo", "foo");
         let text_2 = text("Hello You");
-        let root_b = element("tag2")
-            .append(attr_2)
-            .append(text_2)
-            .append(root_a)
-            .clone();
+        let root_b = element("tag2").append(attr_2).append(text_2).append(root_a);
 
+        let expexted = Some(root_b.clone());
         let mut a = Vec::new();
-
         root_b.flatten(None, &mut a);
-        let mut fnl = FlatNodeList(a);
-        let result = fnl.as_tree();
-        println!("{:?}", result);
-        assert!(false);
+        let result = FlatNodeList(a).as_tree();
+        assert_eq!(result, expexted);
+    }
+    #[test]
+    fn diff_patch_tree() {
+        let a = element("tag1")
+            .append(attr("foo", "bar"))
+            .append(element("tag2").append(text("first text")));
+
+        let b = element("tag1")
+            .append(attr("foo", "bar"))
+            .append(element("tag3").append(text("first text")))
+            .append(text("more text"));
+
+        let mut fa: Vec<FlattenNode> = Vec::new();
+        let mut fb: Vec<FlattenNode> = Vec::new();
+
+        a.flatten(None, &mut fa);
+        b.flatten(None, &mut fb);
+
+        let diff = levenshtein_ops(&fa, &fb);
+
+        println!("{:?}", fa);
+        println!("{:?}", diff);
+
+        let patched = patch(diff, &fa)
+            .expect("Patch errored")
+            .into_iter()
+            .map(|f| f.clone())
+            .collect();
+
+        let result = FlatNodeList(patched)
+            .as_tree()
+            .expect("Could not build a tree");
+        assert_eq!(b.clone(), result);
     }
 }
